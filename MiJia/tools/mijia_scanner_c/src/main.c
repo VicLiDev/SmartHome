@@ -449,6 +449,181 @@ static void cmd_export(int argc, char **argv) {
 }
 
 /* ═══════════════════════════════════════════════════════════ */
+/* 子命令: ha (Home Assistant 实体控制)                         */
+/* ═══════════════════════════════════════════════════════════ */
+
+static void cmd_ha(int argc, char **argv) {
+    if (argc < 3) {
+        printf("  用法: mijia_scanner ha <on|off|toggle|status|list> [entity_id] [选项]\n");
+        printf("\n");
+        printf("  命令:\n");
+        printf("    status <entity_id>     查询实体状态\n");
+        printf("    on     <entity_id>     打开实体 (switch/light/fan/cover)\n");
+        printf("    off    <entity_id>     关闭实体\n");
+        printf("    toggle <entity_id>     切换实体状态\n");
+        printf("    list [--domain xxx]    列出 HA 设备 (按房间分组)\n");
+        printf("\n");
+        printf("  示例:\n");
+        printf("    mijia_scanner ha status switch.study_plug\n");
+        printf("    mijia_scanner ha on light.study_desk\n");
+        printf("    mijia_scanner ha list\n");
+        return;
+    }
+
+    const char *subcmd = argv[2];
+
+    /* 读取配置 */
+    char exe_dir[MAX_STR];
+    get_exe_dir(exe_dir, sizeof(exe_dir));
+    if (!*exe_dir) strncpy(exe_dir, ".", MAX_STR - 1);
+
+    char ha_url[MAX_STR] = {0}, ha_token[MAX_STR] = {0};
+    read_config_ini(exe_dir, ha_url, ha_token);
+
+    /* 也接受命令行参数覆盖 */
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--ha-url") == 0 && i + 1 < argc)
+            strncpy(ha_url, argv[++i], MAX_STR - 1);
+        else if (strcmp(argv[i], "--ha-token") == 0 && i + 1 < argc)
+            strncpy(ha_token, argv[++i], MAX_STR - 1);
+    }
+
+    if (!ha_url[0]) strncpy(ha_url, "http://192.168.6.127:8123", MAX_STR - 1);
+    if (!ha_token[0]) {
+        printf("  %s\n", color_yellow("  未配置 HA_TOKEN，请在 config.ini 中设置"));
+        return;
+    }
+
+    /* list 子命令: 列出所有 HA 设备 */
+    if (strcmp(subcmd, "list") == 0) {
+        device_list_t devices;
+        device_list_init(&devices);
+        ha_get_all_devices(ha_url, ha_token, &devices);
+
+        if (devices.count > 0) {
+            printf("\n  %s\n", color_bold("Home Assistant 设备列表"));
+            printf("  %s\n", color_dim("  ─────────────────────────────────────────────────────────────"));
+
+            /* 按房间分组 */
+            const char *room_order[] = {
+                "客厅", "书房", "厨房", "主卧", "次卧", "卧室", "玄关", "入户玄关", "入户",
+                "休闲阳台", "生活阳台", "阳台", "卫生间", "走廊", NULL
+            };
+
+            char rooms[64][32];
+            int room_count = 0;
+            for (int i = 0; i < devices.count; i++) {
+                bool found = false;
+                for (int j = 0; j < room_count; j++) {
+                    if (strcmp(rooms[j], devices.items[i].room) == 0) { found = true; break; }
+                }
+                if (!found && room_count < 64)
+                    strncpy(rooms[room_count++], devices.items[i].room, 31);
+            }
+
+            /* 冒泡排序 */
+            for (int i = 0; i < room_count - 1; i++) {
+                for (int j = 0; j < room_count - 1 - i; j++) {
+                    int pi = -1, pj = -1;
+                    for (int k = 0; room_order[k]; k++) {
+                        if (strcmp(rooms[j], room_order[k]) == 0) pi = k;
+                        if (strcmp(rooms[j+1], room_order[k]) == 0) pj = k;
+                    }
+                    if (pi == -1) pi = 99;
+                    if (pj == -1) pj = 99;
+                    if (pi > pj) {
+                        char tmp[32];
+                        strncpy(tmp, rooms[j], 31); tmp[31] = '\0';
+                        strncpy(rooms[j], rooms[j+1], 31); rooms[j][31] = '\0';
+                        strncpy(rooms[j+1], tmp, 31); rooms[j+1][31] = '\0';
+                    }
+                }
+            }
+
+            for (int r = 0; r < room_count; r++) {
+                int devs_in_room = 0;
+                for (int i = 0; i < devices.count; i++)
+                    if (strcmp(devices.items[i].room, rooms[r]) == 0) devs_in_room++;
+                if (devs_in_room == 0) continue;
+
+                printf("\n  %s\n", color_bold_fmt("  [%s] (%d 个设备)", rooms[r], devs_in_room));
+                for (int i = 0; i < devices.count; i++) {
+                    if (strcmp(devices.items[i].room, rooms[r]) != 0) continue;
+                    printf("    %s %s\n", color_cpad("36", devices.items[i].type, 8), devices.items[i].name);
+                }
+            }
+        }
+        device_list_free(&devices);
+        return;
+    }
+
+    /* on/off/toggle/status 需要实体 ID */
+    if (argc < 4) {
+        printf("  %s\n", color_yellow("  请指定 entity_id"));
+        return;
+    }
+
+    const char *entity = argv[3];
+
+    if (strcmp(subcmd, "status") == 0) {
+        char state[MAX_STR] = {0};
+        if (ha_get_entity_state(ha_url, ha_token, entity, state, sizeof(state)) == 0) {
+            printf("  实体: %s\n", entity);
+            printf("  状态: %s\n", strcmp(state, "on") == 0 ? color_green("on") :
+                   strcmp(state, "off") == 0 ? color_red("off") : state);
+        }
+    } else if (strcmp(subcmd, "on") == 0 || strcmp(subcmd, "off") == 0) {
+        /* 解析 domain: switch.xxx -> switch, light.xxx -> light */
+        char domain[64] = {0};
+        const char *dot = strchr(entity, '.');
+        if (dot) {
+            int dlen = (int)(dot - entity);
+            if (dlen > 0 && dlen < (int)sizeof(domain)) {
+                strncpy(domain, entity, dlen);
+                domain[dlen] = '\0';
+            }
+        }
+        if (!domain[0]) strncpy(domain, "switch", sizeof(domain) - 1);
+
+        if (ha_call_service(ha_url, ha_token, domain, subcmd, entity) == 0) {
+            printf("  %s → %s\n", entity, color_green(subcmd));
+        } else {
+            char buf[MAX_STR * 2];
+            snprintf(buf, sizeof(buf), "  操作失败: %s", entity);
+            printf("  %s\n", color_red(buf));
+        }
+    } else if (strcmp(subcmd, "toggle") == 0) {
+        char state[MAX_STR] = {0};
+        if (ha_get_entity_state(ha_url, ha_token, entity, state, sizeof(state)) != 0) {
+            printf("  %s\n", color_red("  无法获取当前状态"));
+            return;
+        }
+        const char *target = (strcmp(state, "on") == 0) ? "off" : "on";
+
+        char domain[64] = {0};
+        const char *dot = strchr(entity, '.');
+        if (dot) {
+            int dlen = (int)(dot - entity);
+            if (dlen > 0 && dlen < (int)sizeof(domain)) {
+                strncpy(domain, entity, dlen);
+                domain[dlen] = '\0';
+            }
+        }
+        if (!domain[0]) strncpy(domain, "switch", sizeof(domain) - 1);
+
+        if (ha_call_service(ha_url, ha_token, domain, target, entity) == 0) {
+            printf("  %s: %s → %s\n", entity,
+                   strcmp(state, "on") == 0 ? color_green("on") : color_red("off"),
+                   strcmp(target, "on") == 0 ? color_green("on") : color_red("off"));
+        } else {
+            printf("  %s\n", color_red("  切换失败"));
+        }
+    } else {
+        printf("  未知子命令: %s (支持 on/off/toggle/status/list)\n", subcmd);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════ */
 /* 子命令: monitor                                              */
 /* ═══════════════════════════════════════════════════════════ */
 
@@ -565,6 +740,11 @@ static void print_usage(const char *prog) {
 "  scan --range 10.0.0.1-254       IP 范围扫描\n"
 "  scan --json             JSON 格式输出\n"
 "  scan --csv              CSV 格式输出\n"
+"  ha status <entity>      查询 HA 实体状态\n"
+"  ha on <entity>          打开 HA 实体 (switch/light/fan)\n"
+"  ha off <entity>         关闭 HA 实体\n"
+"  ha toggle <entity>      切换 HA 实体状态\n"
+"  ha list                 列出 HA 设备 (按房间分组)\n"
 "  models                  打印已知型号数据库\n"
 "  info <ip>               查询单台设备信息\n"
 "  monitor --interval 30   每 30 秒监控设备上下线\n"
@@ -616,6 +796,7 @@ int main(int argc, char **argv) {
     else if (strcmp(cmd, "models") == 0) cmd_models(argc, argv);
     else if (strcmp(cmd, "info") == 0)   cmd_info(argc, argv);
     else if (strcmp(cmd, "export") == 0) cmd_export(argc, argv);
+    else if (strcmp(cmd, "ha") == 0)     cmd_ha(argc, argv);
     else if (strcmp(cmd, "monitor") == 0)cmd_monitor(argc, argv);
     else if (strcmp(cmd, "deep") == 0) {
         /* deep scan 暂未实现（需要 AES） */

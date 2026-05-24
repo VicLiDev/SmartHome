@@ -183,6 +183,11 @@ void discover_all(int timeout, device_list_t *devices);
 /* ═══════════════════════════════════════════════════════════ */
 
 void ha_get_all_devices(const char *ha_url, const char *token, device_list_t *devices);
+int  ha_get_entity_state(const char *ha_url, const char *token,
+                         const char *entity_id, char *state_out, int state_sz);
+int  ha_call_service(const char *ha_url, const char *token,
+                     const char *domain, const char *service,
+                     const char *entity_id);
 
 /* ═══════════════════════════════════════════════════════════ */
 /* output.h 函数声明                                             */

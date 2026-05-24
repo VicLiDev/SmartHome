@@ -36,7 +36,8 @@ static size_t curl_write_cb(void *contents, size_t size, size_t nmemb, void *use
     return realsize;
 }
 
-static char *http_get(const char *url, const char *bearer_token) {
+static char *http_request(const char *url, const char *bearer_token,
+                          const char *method, const char *post_data) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
@@ -52,6 +53,7 @@ static char *http_get(const char *url, const char *bearer_token) {
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
@@ -61,9 +63,23 @@ static char *http_get(const char *url, const char *bearer_token) {
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
+    if (post_data)
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         printf("  %s\n", color_dim_fmt("  [HA] 连接失败: %s", curl_easy_strerror(res)));
+        free(buf.data);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        curl_global_cleanup();
+        return NULL;
+    }
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code < 200 || http_code >= 300) {
+        printf("  %s\n", color_dim_fmt("  [HA] HTTP %ld", http_code));
         free(buf.data);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
@@ -341,7 +357,7 @@ void ha_get_all_devices(const char *ha_url, const char *token, device_list_t *de
     char url[MAX_STR + 32];
     snprintf(url, sizeof(url), "%s/api/states", ha_url);
 
-    char *response = http_get(url, token);
+    char *response = http_request(url, token, "GET", NULL);
     if (!response) return;
 
     /* 解析 states 数组 */
@@ -420,4 +436,78 @@ void ha_get_all_devices(const char *ha_url, const char *token, device_list_t *de
     for (int i = 0; i < seen_count; i++) free(seen_keys[i]);
     free(seen_keys);
 #endif /* HAVE_LIBCURL */
+}
+
+/* ═══════════════════════════════════════════════════════════ */
+/* HA 实体状态查询 & 服务调用                                     */
+/* ═══════════════════════════════════════════════════════════ */
+
+/**
+ * ha_get_entity_state — 查询单个实体的 state 字段
+ * @return 0 成功, -1 失败
+ */
+int ha_get_entity_state(const char *ha_url, const char *token,
+                        const char *entity_id, char *state_out, int state_sz) {
+    if (!token || !*token) {
+        printf("  %s\n", color_dim("  [HA] 未配置 HA_TOKEN"));
+        return -1;
+    }
+    state_out[0] = '\0';
+
+#ifndef HAVE_LIBCURL
+    printf("  %s\n", color_dim("  [HA] 需要安装 libcurl4-openssl-dev 后重新编译"));
+    return -1;
+#else
+    char url[MAX_STR + 64];
+    snprintf(url, sizeof(url), "%s/api/states/%s", ha_url, entity_id);
+
+    char *resp = http_request(url, token, "GET", NULL);
+    if (!resp) return -1;
+
+    /* 提取 "state": "xxx" */
+    if (!json_get_string(resp, "state", state_out, state_sz)) {
+        /* 可能是错误响应 */
+        char msg[256] = {0};
+        if (json_get_string(resp, "message", msg, sizeof(msg))) {
+            char buf[MAX_STR * 2];
+            snprintf(buf, sizeof(buf), "  [HA] 错误: %s", msg);
+            printf("  %s\n", color_red(buf));
+        }
+        free(resp);
+        return -1;
+    }
+
+    free(resp);
+    return 0;
+#endif
+}
+
+/**
+ * ha_call_service — 调用 HA 服务
+ * @return 0 成功, -1 失败
+ */
+int ha_call_service(const char *ha_url, const char *token,
+                    const char *domain, const char *service,
+                    const char *entity_id) {
+    if (!token || !*token) {
+        printf("  %s\n", color_dim("  [HA] 未配置 HA_TOKEN"));
+        return -1;
+    }
+
+#ifndef HAVE_LIBCURL
+    printf("  %s\n", color_dim("  [HA] 需要安装 libcurl4-openssl-dev 后重新编译"));
+    return -1;
+#else
+    char url[MAX_STR + 64];
+    snprintf(url, sizeof(url), "%s/api/services/%s/%s", ha_url, domain, service);
+
+    char post[MAX_STR + 128];
+    snprintf(post, sizeof(post), "{\"entity_id\":\"%s\"}", entity_id);
+
+    char *resp = http_request(url, token, "POST", post);
+    if (!resp) return -1;
+
+    free(resp);
+    return 0;
+#endif
 }

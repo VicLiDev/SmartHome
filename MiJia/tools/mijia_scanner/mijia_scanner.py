@@ -31,7 +31,7 @@ from mijia_scanner_lib.network import (
     parse_ip_ranges, arp_scan, _ping_sweep,
     discover_devices_range, discover_devices_from_alive, arp_lookup,
 )
-from mijia_scanner_lib.ha import ha_get_all_devices
+from mijia_scanner_lib.ha import ha_get_all_devices, ha_get_entity_state, ha_call_service
 from mijia_scanner_lib.output import print_device_table, export_json, export_csv
 
 
@@ -432,6 +432,96 @@ def cmd_export(args):
         print(Color.red(f"  不支持的格式: {fmt}"))
 
 
+def _load_ha_config(args):
+    """加载 HA 配置: 命令行 > config.ini > 默认值"""
+    ha_url = getattr(args, "ha_url", "") or ""
+    ha_token = getattr(args, "ha_token", "") or ""
+    if not ha_token:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+        if os.path.isfile(cfg_path):
+            cfg = {}
+            for line in open(cfg_path):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+            ha_url = ha_url or cfg.get("HA_URL", "")
+            ha_token = ha_token or cfg.get("HA_TOKEN", "")
+    if not ha_url:
+        ha_url = "http://192.168.6.127:8123"
+    return ha_url, ha_token
+
+
+def cmd_ha(args):
+    """HA 实体控制子命令"""
+    subcmd = args.ha_subcmd
+
+    ha_url, ha_token = _load_ha_config(args)
+    if not ha_token:
+        print(Color.yellow("  未配置 HA_TOKEN，请在 config.ini 中设置"))
+        return
+
+    if subcmd == "list":
+        devices = ha_get_all_devices(ha_url, ha_token)
+        if devices:
+            print()
+            print(Color.bold("  Home Assistant 设备列表"))
+            print(Color.dim("  " + "-" * 110))
+            by_room = {}
+            for hd in devices:
+                r = hd["room"]
+                if r not in by_room:
+                    by_room[r] = []
+                by_room[r].append(hd)
+
+            room_order = [
+                "客厅", "书房", "厨房", "主卧", "次卧", "卧室", "玄关", "入户玄关", "入户",
+                "休闲阳台", "生活阳台", "阳台", "卫生间", "走廊",
+            ]
+            for room in sorted(by_room.keys(),
+                               key=lambda r: (room_order.index(r) if r in room_order else 99)):
+                devs = by_room[room]
+                print()
+                print(Color.bold(f"  [{room}] ({len(devs)} 个设备)"))
+                for d in devs:
+                    print(f"    {pad_cjk(d['type'], 8)} {d['name']}")
+            print()
+
+    elif subcmd == "status":
+        entity = args.entity_id
+        state = ha_get_entity_state(ha_url, ha_token, entity)
+        if state is not None:
+            color_fn = Color.green if state == "on" else Color.red if state == "off" else lambda x: x
+            print(f"  实体: {entity}")
+            print(f"  状态: {color_fn(state)}")
+
+    elif subcmd in ("on", "off"):
+        entity = args.entity_id
+        domain = entity.split(".")[0] if "." in entity else "switch"
+        if ha_call_service(ha_url, ha_token, domain, subcmd, entity):
+            print(f"  {entity} -> {Color.green(subcmd)}")
+        else:
+            print(f"  {Color.red('操作失败')}: {entity}")
+
+    elif subcmd == "toggle":
+        entity = args.entity_id
+        state = ha_get_entity_state(ha_url, ha_token, entity)
+        if state is None:
+            print(Color.red("  无法获取当前状态"))
+            return
+        target = "off" if state == "on" else "on"
+        domain = entity.split(".")[0] if "." in entity else "switch"
+        if ha_call_service(ha_url, ha_token, domain, target, entity):
+            c_from = Color.green(state) if state == "on" else Color.red(state)
+            c_to = Color.green(target) if target == "on" else Color.red(target)
+            print(f"  {entity}: {c_from} -> {c_to}")
+        else:
+            print(Color.red("  切换失败"))
+
+    else:
+        print(f"  未知子命令: {subcmd}")
+
+
 # ═══════════════════════════════════════════════════════════
 # 命令行参数解析
 # ═══════════════════════════════════════════════════════════
@@ -502,6 +592,14 @@ def build_parser():
     p_exp.add_argument("--output", "-o", type=str, default=None, help="输出文件路径")
     p_exp.add_argument("--timeout", type=int, default=5, help="扫描超时秒数")
 
+    # ha
+    p_ha = subparsers.add_parser("ha", help="Home Assistant 实体控制")
+    p_ha.add_argument("ha_subcmd", choices=["on", "off", "toggle", "status", "list"],
+                      help="操作: on/off/toggle/status/list")
+    p_ha.add_argument("entity_id", nargs="?", default="", help="实体 ID (如 switch.xxx)")
+    p_ha.add_argument("--ha-url", type=str, default="", help="HA 地址")
+    p_ha.add_argument("--ha-token", type=str, default="", help="HA token")
+
     return parser
 
 
@@ -525,6 +623,7 @@ def main():
         "info":    cmd_info,
         "models":  cmd_models,
         "export":  cmd_export,
+        "ha":      cmd_ha,
     }
 
     handler = cmd_map.get(args.command)
